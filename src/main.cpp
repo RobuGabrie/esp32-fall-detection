@@ -14,6 +14,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_bt.h"
 
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "model-parameters/model_variables.h"
@@ -68,13 +69,11 @@
 // Custom UUIDs — replace with your own if deploying. Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 #define BLE_DEVICE_NAME      "FallGuard"
 #define BLE_SERVICE_UUID     "f00dbabe-0001-1000-8000-00805f9b34fb"
-#define BLE_TELEMETRY_UUID   "f00dbabe-0002-1000-8000-00805f9b34fb"  // notify: 16B packed sensor data @ 10Hz
-#define BLE_EVENT_UUID       "f00dbabe-0003-1000-8000-00805f9b34fb"  // notify: CSV event lines (trigger/ml/verdict)
-#define BLE_LOG_UUID         "f00dbabe-0004-1000-8000-00805f9b34fb"  // read: full fall log as CSV
+#define BLE_TELEMETRY_UUID   "f00dbabe-0002-1000-8000-00805f9b34fb"  // notify: 6B status packet
+#define BLE_EVENT_UUID       "f00dbabe-0003-1000-8000-00805f9b34fb"  // notify: "FALL" string on confirmed fall
 #define BLE_CMD_UUID         "f00dbabe-0005-1000-8000-00805f9b34fb"  // write: commands from phone
 
-#define BLE_TELEMETRY_INTERVAL_MS 100   // 10Hz live stream
-#define FALL_LOG_SIZE             16    // last N triggers retained in RAM
+#define BLE_TELEMETRY_INTERVAL_MS 500   // 2Hz live stream — lower to avoid flooding the link
 
 // --- Fall Detection Parameters ---
 // EMA time constant: alpha=0.02 → ~50 samples (500ms) to track slow orientation drift
@@ -154,50 +153,21 @@ volatile unsigned long last_trigger_time = 0;
 BLEServer*         ble_server   = nullptr;
 BLECharacteristic* ble_tel_char = nullptr;
 BLECharacteristic* ble_evt_char = nullptr;
-BLECharacteristic* ble_log_char = nullptr;
 BLECharacteristic* ble_cmd_char = nullptr;
 volatile bool      ble_connected = false;
 unsigned long      last_ble_telemetry_send = 0;
 
-// ---- Fall event log (calibration data) ----
-// Circular buffer of the last N triggers with full gate breakdown.
-// Readable via BLE_LOG_UUID — phone connects, reads the entire log as CSV, parses for calibration insights.
-struct FallLogEntry {
-    uint32_t ts_ms;            // millis() at trigger
-    char     path;             // 'A' (freefall+impact) or 'B' (impact-only)
-    float    trig_acc;         // accMag at trigger
-    float    trig_gyro;        // gyroMag at trigger
-    float    pre_gx, pre_gy, pre_gz;  // pre-fall gravity reference
-    float    ml_c0, ml_c1, ml_c2;     // 3 sliding-window confidences
-    float    ml_threshold;
-    uint8_t  ml_pass_count;    // 0..3 windows that passed threshold
-    float    angle_deg;
-    uint8_t  ml_pass;
-    uint8_t  stillness_pass;
-    uint8_t  orient_pass;
-    uint8_t  fall_confirmed;
-};
-FallLogEntry fall_log[FALL_LOG_SIZE];
-int fall_log_head  = 0;
-int fall_log_count = 0;
-
-// Binary packed telemetry packet sent at 10Hz over BLE.
-// Encoded to 16 bytes so it fits in default BLE MTU (23-3 ATT header = 20 bytes).
-// Phone reconstructs floats: acc_i / 100.0f → m/s², gyro_i / 1000.0f → rad/s.
+// Minimal status packet — no raw IMU data, just high-level state.
+// activity: 0=stationary, 1=walking, 2=running, 3=hand-motion
+// fall_state: 0=idle, 1=fall confirmed (within alert window)
 struct __attribute__((packed)) TelemetryPacket {
-    int16_t  ax_x100;
-    int16_t  ay_x100;
-    int16_t  az_x100;
-    int16_t  gx_x1000;
-    int16_t  gy_x1000;
-    int16_t  gz_x1000;
-    uint16_t accMag_x100;
-    uint8_t  flags;        // bit 0: freefall, bit 1: in_event, bits 2-3: activity (0-3)
-    uint8_t  battery_pct;
-    uint8_t  stress_pct;   // 0-100 derived stress level
-    uint8_t  hr;           // current heart rate (bpm), 0 if no reading
-    uint8_t  spo2;         // current SpO2 (%), 0 if no reading
-};                         // total: 19 bytes — still fits in default 20-byte BLE ATT MTU
+    uint8_t activity;
+    uint8_t fall_state;
+    uint8_t battery_pct;
+    uint8_t stress_pct;
+    uint8_t hr;
+    uint8_t spo2;
+};
 
 // Activity state — written by background_task only
 float current_activity_tag[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -416,12 +386,7 @@ class BleCmdCallbacks : public BLECharacteristicCallbacks {
         std::string v = c->getValue();
         if (v.empty()) return;
         Serial.printf("[BLE] cmd: %.*s\n", (int)v.size(), v.data());
-        // Simple text commands: "reset_log", "alert_off"
-        if (v == "reset_log") {
-            fall_log_head = 0;
-            fall_log_count = 0;
-            Serial.println("[BLE] Fall log cleared");
-        } else if (v == "alert_off") {
+        if (v == "alert_off") {
             fall_alert_until = 0;
             digitalWrite(LED_RED, LOW);
             ledcWrite(BUZZER_CH, 0);
@@ -445,8 +410,6 @@ void ble_init() {
     ble_evt_char = svc->createCharacteristic(BLE_EVENT_UUID, BLECharacteristic::PROPERTY_NOTIFY);
     ble_evt_char->addDescriptor(new BLE2902());
 
-    ble_log_char = svc->createCharacteristic(BLE_LOG_UUID, BLECharacteristic::PROPERTY_READ);
-
     ble_cmd_char = svc->createCharacteristic(BLE_CMD_UUID,
                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
     ble_cmd_char->setCallbacks(new BleCmdCallbacks());
@@ -465,16 +428,8 @@ void ble_init() {
 void ble_send_telemetry() {
     if (!ble_connected || !ble_tel_char) return;
     TelemetryPacket p;
-    p.ax_x100     = (int16_t) constrain((int)(disp_ax  * 100.0f), -32768, 32767);
-    p.ay_x100     = (int16_t) constrain((int)(disp_ay  * 100.0f), -32768, 32767);
-    p.az_x100     = (int16_t) constrain((int)(disp_az  * 100.0f), -32768, 32767);
-    p.gx_x1000    = (int16_t) constrain((int)(disp_gx  * 1000.0f), -32768, 32767);
-    p.gy_x1000    = (int16_t) constrain((int)(disp_gy  * 1000.0f), -32768, 32767);
-    p.gz_x1000    = (int16_t) constrain((int)(disp_gz  * 1000.0f), -32768, 32767);
-    p.accMag_x100 = (uint16_t) constrain((int)(disp_accMag * 100.0f), 0, 65535);
-    p.flags       = (dbg_freefall_active ? 0x01 : 0)
-                  | ((trigger_fired || gathering_post_buffer) ? 0x02 : 0)
-                  | ((current_activity_idx & 0x03) << 2);
+    p.activity    = (uint8_t)(current_activity_idx & 0xFF);
+    p.fall_state  = fall_alert_until ? 1 : 0;
     p.battery_pct = (uint8_t) battery_percent(cached_vbat);
     p.stress_pct  = stress_level;
     p.hr          = (uint8_t) (disp_hr   > 255 ? 255 : (disp_hr   < 0 ? 0 : disp_hr));
@@ -490,30 +445,6 @@ void ble_send_event(const char* line) {
     ble_evt_char->notify();
 }
 
-// Append an entry to the rolling fall log and refresh the readable BLE log characteristic.
-void fall_log_append(const FallLogEntry& e) {
-    fall_log[fall_log_head] = e;
-    fall_log_head  = (fall_log_head + 1) % FALL_LOG_SIZE;
-    if (fall_log_count < FALL_LOG_SIZE) fall_log_count++;
-
-    if (!ble_log_char) return;
-    // Serialize entire log as CSV string (header + rows)
-    static char buf[2048];
-    int n = 0;
-    n += snprintf(buf + n, sizeof(buf) - n,
-                  "ts,path,acc,gyro,gx,gy,gz,c0,c1,c2,th,pw,ang,ml,still,ori,fall\n");
-    int start = (fall_log_head - fall_log_count + FALL_LOG_SIZE) % FALL_LOG_SIZE;
-    for (int i = 0; i < fall_log_count && n < (int)sizeof(buf) - 128; i++) {
-        const FallLogEntry& r = fall_log[(start + i) % FALL_LOG_SIZE];
-        n += snprintf(buf + n, sizeof(buf) - n,
-                      "%lu,%c,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%.1f,%u,%u,%u,%u\n",
-                      (unsigned long)r.ts_ms, r.path, r.trig_acc, r.trig_gyro,
-                      r.pre_gx, r.pre_gy, r.pre_gz,
-                      r.ml_c0, r.ml_c1, r.ml_c2, r.ml_threshold, r.ml_pass_count,
-                      r.angle_deg, r.ml_pass, r.stillness_pass, r.orient_pass, r.fall_confirmed);
-    }
-    ble_log_char->setValue((uint8_t*)buf, n);
-}
 
 // =============================================================================
 // DISPLAY — called from background_task while holding i2c_mutex
@@ -1092,17 +1023,6 @@ void background_task(void *pvParameters) {
             // overwritten in the ring buffer (5s buffer vs 3.5s+ of evaluation delay).
             int trigger_h = trigger_head_idx;
 
-            // BLE: notify phone immediately on trigger
-            {
-                char line[160];
-                snprintf(line, sizeof(line),
-                         "TRIG,%lu,%c,%.2f,%.2f,%.2f,%.2f,%.2f\n",
-                         (unsigned long)now, (char)dbg_last_path,
-                         (float)trigger_accMag, (float)trigger_gyroMag,
-                         (float)trigger_gravity_x, (float)trigger_gravity_y, (float)trigger_gravity_z);
-                ble_send_event(line);
-            }
-
             // Phase 1: brief wait so ~50 post-impact samples (0.5s) land in the buffer.
             vTaskDelay(pdMS_TO_TICKS(ML_WAIT_MS));
 
@@ -1149,16 +1069,6 @@ void background_task(void *pvParameters) {
 #if DEBUG
             Serial.printf("ML verdict: %d/3 windows passed → %s\n", passing_windows, ml_pass ? "PASS" : "FAIL");
 #endif
-            // BLE: notify phone with ML result
-            {
-                char line[160];
-                snprintf(line, sizeof(line),
-                         "ML,%lu,%.3f,%.3f,%.3f,%.2f,%d,%d\n",
-                         (unsigned long)millis(),
-                         dbg_last_conf[0], dbg_last_conf[1], dbg_last_conf[2],
-                         threshold, passing_windows, ml_pass ? 1 : 0);
-                ble_send_event(line);
-            }
 
             // Phase 2: wait for posture to settle (stillness + orientation gates need calm post-fall state).
             vTaskDelay(pdMS_TO_TICKS(SETTLE_WAIT_MS));
@@ -1186,36 +1096,8 @@ void background_task(void *pvParameters) {
                 update_activity_leds();
             }
 
-            // BLE: notify phone with verdict + append to log for later read
-            {
-                char line[160];
-                snprintf(line, sizeof(line),
-                         "VRD,%lu,%d,%d,%d,%.1f,%d\n",
-                         (unsigned long)millis(),
-                         ml_pass ? 1 : 0, stillness_ok ? 1 : 0, orient_ok ? 1 : 0,
-                         dbg_last_angle_deg, fall_ok ? 1 : 0);
-                ble_send_event(line);
-
-                FallLogEntry e = {};
-                e.ts_ms         = millis();
-                e.path          = (char)dbg_last_path;
-                e.trig_acc      = trigger_accMag;
-                e.trig_gyro     = trigger_gyroMag;
-                e.pre_gx        = trigger_gravity_x;
-                e.pre_gy        = trigger_gravity_y;
-                e.pre_gz        = trigger_gravity_z;
-                e.ml_c0         = dbg_last_conf[0];
-                e.ml_c1         = dbg_last_conf[1];
-                e.ml_c2         = dbg_last_conf[2];
-                e.ml_threshold  = threshold;
-                e.ml_pass_count = (uint8_t)passing_windows;
-                e.angle_deg     = dbg_last_angle_deg;
-                e.ml_pass       = ml_pass ? 1 : 0;
-                e.stillness_pass = stillness_ok ? 1 : 0;
-                e.orient_pass   = orient_ok ? 1 : 0;
-                e.fall_confirmed = fall_ok ? 1 : 0;
-                fall_log_append(e);
-            }
+            // BLE: notify phone only when a fall is actually confirmed.
+            if (fall_ok) ble_send_event("FALL");
 
             gathering_post_buffer = false;
         }
@@ -1316,15 +1198,18 @@ void setup() {
 
     i2c_mutex = xSemaphoreCreateMutex();
 
-    // Init BLE last so all sensor state is valid when the first connection arrives
+    // Init BLE last so all sensor state is valid when the first connection arrives.
+    // Free classic-BT controller memory first — we only use BLE, recovers ~30KB heap.
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
     ble_init();
 
     update_activity_leds();
 
     // sampling_task: Core 1, priority 20 — real-time 100Hz sensor loop
-    xTaskCreatePinnedToCore(sampling_task,   "sampler",    4096,  nullptr, 20, nullptr, 1);
-    // background_task: Core 0, priority 3 — ML inference, display, slow sensors, BLE notify calls
-    xTaskCreatePinnedToCore(background_task, "background", 16384, nullptr,  3, nullptr, 0);
+    xTaskCreatePinnedToCore(sampling_task,   "sampler",    8192,  nullptr, 20, nullptr, 1);
+    // background_task: Core 0, priority 10 — bumped above default BLE host (5) so fall
+    // evaluation isn't starved when BLE is busy advertising/notifying.
+    xTaskCreatePinnedToCore(background_task, "background", 16384, nullptr, 10, nullptr, 0);
 }
 
 // All work is in the two FreeRTOS tasks above.
