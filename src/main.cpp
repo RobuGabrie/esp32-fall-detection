@@ -18,6 +18,7 @@
 
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "model-parameters/model_variables.h"
+#include "derived_metrics.h"
 
 // --- Hardware & Config ---
 #define I2C_SDA        21
@@ -54,7 +55,7 @@
 #define BIO_MFIO_PIN       17
 #define VBAT_PIN           35       // ADC1_CH7
 #define VBAT_DIVIDER       2.0f
-#define DISPLAY_PAGES      7  // page 5 = stress, page 6 = debug
+#define DISPLAY_PAGES      9  // 5=stress, 6=debug, 7=posture/sleep, 8=steps/hrv
 #define BIO_READ_INTERVAL  1000
 #define TEMP_READ_INTERVAL 60000
 #define VBAT_READ_INTERVAL 60000
@@ -157,16 +158,36 @@ BLECharacteristic* ble_cmd_char = nullptr;
 volatile bool      ble_connected = false;
 unsigned long      last_ble_telemetry_send = 0;
 
-// Minimal status packet — no raw IMU data, just high-level state.
-// activity: 0=stationary, 1=walking, 2=running, 3=hand-motion
-// fall_state: 0=idle, 1=fall confirmed (within alert window)
+// Versioned status packet. v2 layout (14 bytes):
+//   [0]  version       = 2
+//   [1]  activity      0=stationary 1=walking 2=running 3=hand-motion
+//   [2]  fall_state    0=idle 1=fall confirmed (within alert window)
+//   [3]  battery_pct
+//   [4]  stress_pct
+//   [5]  hr            bpm
+//   [6]  spo2          %
+//   [7]  posture       0=upright 1=reclined 2=lying 3=inverted
+//   [8]  sleep_state   0=awake 1=resting 2=light_sleep 3=deep_sleep
+//   [9]  step_count_lo (uint16 LE)
+//   [10] step_count_hi
+//   [11] cadence_spm   steps per minute
+//   [12] hrv_rmssd     ms approx (HR-based proxy)
+//   [13] resting_hr    bpm
+#define TELEMETRY_PACKET_VERSION 2
 struct __attribute__((packed)) TelemetryPacket {
-    uint8_t activity;
-    uint8_t fall_state;
-    uint8_t battery_pct;
-    uint8_t stress_pct;
-    uint8_t hr;
-    uint8_t spo2;
+    uint8_t  version;
+    uint8_t  activity;
+    uint8_t  fall_state;
+    uint8_t  battery_pct;
+    uint8_t  stress_pct;
+    uint8_t  hr;
+    uint8_t  spo2;
+    uint8_t  posture;
+    uint8_t  sleep_state;
+    uint16_t step_count;
+    uint8_t  cadence_spm;
+    uint8_t  hrv_rmssd;
+    uint8_t  resting_hr;
 };
 
 // Activity state — written by background_task only
@@ -428,12 +449,20 @@ void ble_init() {
 void ble_send_telemetry() {
     if (!ble_connected || !ble_tel_char) return;
     TelemetryPacket p;
+    p.version     = TELEMETRY_PACKET_VERSION;
     p.activity    = (uint8_t)(current_activity_idx & 0xFF);
     p.fall_state  = fall_alert_until ? 1 : 0;
     p.battery_pct = (uint8_t) battery_percent(cached_vbat);
     p.stress_pct  = stress_level;
     p.hr          = (uint8_t) (disp_hr   > 255 ? 255 : (disp_hr   < 0 ? 0 : disp_hr));
     p.spo2        = (uint8_t) (disp_spo2 > 100 ? 100 : (disp_spo2 < 0 ? 0 : disp_spo2));
+    DerivedMetrics dm = dm_get();
+    p.posture     = dm.posture;
+    p.sleep_state = dm.sleep_state;
+    p.step_count  = dm.step_count;
+    p.cadence_spm = dm.cadence_spm;
+    p.hrv_rmssd   = dm.hrv_rmssd;
+    p.resting_hr  = dm.resting_hr;
     ble_tel_char->setValue((uint8_t*)&p, sizeof(p));
     ble_tel_char->notify();
 }
@@ -515,7 +544,7 @@ void render_display() {
         display.setCursor(0, 22); display.print(buf);
         display.drawRect(0, 34, 80, 10, SSD1306_WHITE);
         display.fillRect(1, 35, (pct * 78) / 100, 8, SSD1306_WHITE);
-        display.setCursor(104, 56); display.print("1/7");
+        display.setCursor(104, 56); display.print("1/9");
 
     } else if (display_page == 1) {
         display.setCursor(0, 0); display.println("Accel (m/s2)");
@@ -525,7 +554,7 @@ void render_display() {
         display.setCursor(0, 22); display.println(buf);
         snprintf(buf, sizeof(buf), " Mag:%6.2f", (float)disp_accMag);
         display.setCursor(0, 32); display.println(buf);
-        display.setCursor(104, 56); display.print("2/7");
+        display.setCursor(104, 56); display.print("2/9");
 
     } else if (display_page == 2) {
         display.setCursor(0, 0); display.println("Gyro (rad/s)");
@@ -533,7 +562,7 @@ void render_display() {
         display.setCursor(0, 12); display.println(buf);
         snprintf(buf, sizeof(buf), " Z:%7.3f", (float)disp_gz);
         display.setCursor(0, 22); display.println(buf);
-        display.setCursor(104, 56); display.print("3/7");
+        display.setCursor(104, 56); display.print("3/9");
 
     } else if (display_page == 3) {
         float temp_f = disp_temp_c * 9.0f / 5.0f + 32.0f;
@@ -546,7 +575,7 @@ void render_display() {
         snprintf(buf, sizeof(buf), "%.2f F", temp_f);
         display.setCursor(10, 38); display.println(buf);
         display.setTextSize(1);
-        display.setCursor(104, 56); display.print("4/7");
+        display.setCursor(104, 56); display.print("4/9");
 
     } else if (display_page == 4) {
         display.setTextSize(1);
@@ -567,7 +596,7 @@ void render_display() {
             display.setCursor(0, 56); display.print(buf);
         }
         display.setTextSize(1);
-        display.setCursor(104, 56); display.print("5/7");
+        display.setCursor(104, 56); display.print("5/9");
 
     } else if (display_page == 5) {
         // Stress level — derived from HR vs baseline + activity + SpO2 + temperature
@@ -603,9 +632,9 @@ void render_display() {
         } else {
             display.setCursor(0, 54); display.print("calibrating...");
         }
-        display.setCursor(110, 56); display.print("6/7");
+        display.setCursor(110, 56); display.print("6/9");
 
-    } else {
+    } else if (display_page == 6) {
         // Debug page — live trigger telemetry for tuning thresholds
         display.setTextSize(1);
         display.setCursor(0, 0);  display.print("Fall Debug");
@@ -637,7 +666,40 @@ void render_display() {
         snprintf(buf, sizeof(buf), "%s a:%.0f", dbg_last_verdict, dbg_last_angle_deg);
         display.setCursor(0, 52); display.print(buf);
 
-        display.setCursor(110, 56); display.print("7/7");
+        display.setCursor(110, 56); display.print("7/9");
+
+    } else if (display_page == 7) {
+        // Posture & sleep state — derived from EMA gravity + activity + HR
+        DerivedMetrics dm = dm_get();
+        const char* posture_lbl[]  = {"UPRIGHT", "RECLINED", "LYING", "INVERTED"};
+        const char* sleep_lbl[]    = {"AWAKE", "RESTING", "LIGHT SLP", "DEEP SLP"};
+        display.setTextSize(1);
+        display.setCursor(0, 0);  display.print("Posture / Sleep");
+        display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
+        display.setCursor(0, 14); display.print("Posture:");
+        display.setTextSize(2);
+        display.setCursor(0, 24); display.print(posture_lbl[dm.posture & 3]);
+        display.setTextSize(1);
+        display.setCursor(0, 44); display.print("Sleep: ");
+        display.print(sleep_lbl[dm.sleep_state & 3]);
+        display.setCursor(110, 56); display.print("8/9");
+
+    } else if (display_page == 8) {
+        // Steps, cadence, HRV proxy, resting HR
+        DerivedMetrics dm = dm_get();
+        display.setTextSize(1);
+        display.setCursor(0, 0);  display.print("Activity Stats");
+        display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
+        snprintf(buf, sizeof(buf), "Steps:  %5u", (unsigned)dm.step_count);
+        display.setCursor(0, 14); display.print(buf);
+        snprintf(buf, sizeof(buf), "Cadence: %3u spm", (unsigned)dm.cadence_spm);
+        display.setCursor(0, 26); display.print(buf);
+        snprintf(buf, sizeof(buf), "HRV:    %3u", (unsigned)dm.hrv_rmssd);
+        display.setCursor(0, 38); display.print(buf);
+        snprintf(buf, sizeof(buf), "Rest HR: %3u bpm", (unsigned)dm.resting_hr);
+        display.setCursor(0, 50); display.print(buf);
+        display.setCursor(110, 56); display.print("9/9");
+
     }
     display.display();
 }
@@ -768,6 +830,9 @@ void sampling_task(void *pvParameters) {
         head_index = (head_index + 1) % MAX_SAMPLES;
         portEXIT_CRITICAL(&ring_buf_mux);
 
+        // Derived metrics: cheap 100Hz update (step peak detection)
+        dm_update_fast(accMag);
+
         // Update display cache — volatile ensures visibility across cores
         disp_ax = ax; disp_ay = ay; disp_az = az;
         disp_gx = gx; disp_gy = gy; disp_gz = gz;
@@ -881,6 +946,7 @@ void sampling_task(void *pvParameters) {
 // =============================================================================
 void background_task(void *pvParameters) {
     unsigned long last_activity_check = 0;
+    unsigned long last_dm_slow_tick   = 0;
 
     while (true) {
         unsigned long now = millis();
@@ -966,6 +1032,18 @@ void background_task(void *pvParameters) {
             fall_alert_until = 0;
             digitalWrite(LED_RED, LOW);
             update_activity_leds();
+        }
+
+        // --- Derived metrics slow tick (1Hz) ---
+        if (now - last_dm_slow_tick >= 1000) {
+            last_dm_slow_tick = now;
+            float gx, gy, gz;
+            portENTER_CRITICAL(&ring_buf_mux);
+            gx = gravity_x; gy = gravity_y; gz = gravity_z;
+            portEXIT_CRITICAL(&ring_buf_mux);
+            int hr_now = bio_has_reading ? disp_hr : 0;
+            int hr_base = (int)hr_baseline;
+            dm_update_slow(current_activity_idx, hr_now, hr_base, gx, gy, gz);
         }
 
         // --- BLE: 10Hz telemetry stream ---
@@ -1197,6 +1275,8 @@ void setup() {
     }
 
     i2c_mutex = xSemaphoreCreateMutex();
+
+    dm_init();
 
     // Init BLE last so all sensor state is valid when the first connection arrives.
     // Free classic-BT controller memory first — we only use BLE, recovers ~30KB heap.
