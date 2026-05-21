@@ -55,6 +55,10 @@
 #define BIO_MFIO_PIN       17
 #define VBAT_PIN           35       // ADC1_CH7
 #define VBAT_DIVIDER       2.0f
+// Battery runtime estimate. Measured avg draw ~65 mA, spikes ~120 mA (rare, ignored).
+// Set BATTERY_CAPACITY_MAH to your pack's actual capacity.
+#define BATTERY_CAPACITY_MAH    2000
+#define BATTERY_AVG_CURRENT_MA  65
 #define DISPLAY_PAGES      9  // 5=stress, 6=debug, 7=posture/sleep, 8=steps/hrv
 #define BIO_READ_INTERVAL  1000
 #define TEMP_READ_INTERVAL 60000
@@ -260,6 +264,12 @@ void IRAM_ATTR btn_isr() {
 float read_battery_voltage() {
     float vout = analogRead(VBAT_PIN) / 4095.0f * 3.3f;
     return vout * VBAT_DIVIDER;
+}
+
+// Minutes of runtime left at typical current draw. Linear in remaining capacity.
+int battery_minutes_remaining(int pct) {
+    if (pct <= 0) return 0;
+    return (int)(((long)pct * BATTERY_CAPACITY_MAH * 60L) / (100L * BATTERY_AVG_CURRENT_MA));
 }
 
 int battery_percent(float v) {
@@ -544,6 +554,9 @@ void render_display() {
         display.setCursor(0, 22); display.print(buf);
         display.drawRect(0, 34, 80, 10, SSD1306_WHITE);
         display.fillRect(1, 35, (pct * 78) / 100, 8, SSD1306_WHITE);
+        int mins = battery_minutes_remaining(pct);
+        snprintf(buf, sizeof(buf), "Left: %dh %02dm", mins / 60, mins % 60);
+        display.setCursor(0, 48); display.print(buf);
         display.setCursor(104, 56); display.print("1/9");
 
     } else if (display_page == 1) {
