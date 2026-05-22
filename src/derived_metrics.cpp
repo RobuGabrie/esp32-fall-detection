@@ -2,8 +2,9 @@
 #include <math.h>
 
 // ---------- Tunables ----------
-#define STEP_AC_THRESHOLD     2.5f   // m/s² above gravity tracker = candidate step peak
-#define STEP_REFRACTORY_SAMP  25     // 250ms at 100Hz — minimum spacing between peaks
+#define STEP_AC_THRESHOLD     3.0f   // m/s² above gravity tracker — rejects weaker secondary peak
+#define STEP_REFRACTORY_SAMP  40     // 400ms at 100Hz — blocks heel-strike + push-off double-count
+                                     // allows up to 150 spm (covers normal running cadence)
 #define STEP_EMA_ALPHA        0.02f  // ~500ms time constant for gravity tracker
 
 // Posture tilt (deg from gravity vector pointing "up" along device +Z)

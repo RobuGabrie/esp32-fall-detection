@@ -107,9 +107,15 @@
 
 #define COOLDOWN_MS            4000
 
-// --- Class Indices (verify against EI Studio label order) ---
+// --- Class Indices ---
+// Internal convention (used throughout code, BLE, display, LEDs):
+//   0=stationary, 1=walking, 2=running, 3=hand_motion
+// Edge Impulse model returns labels ALPHABETICALLY:
+//   0=hand_motion, 1=running, 2=stationary, 3=walking
+// Remap EI output → internal via EI_TO_INTERNAL below.
 #define HAND_MOTION_IDX 3
 #define FALL_IDX        0
+static const int EI_TO_INTERNAL[4] = { 3, 2, 0, 1 };
 
 #define DEBUG 1
 
@@ -162,22 +168,24 @@ BLECharacteristic* ble_cmd_char = nullptr;
 volatile bool      ble_connected = false;
 unsigned long      last_ble_telemetry_send = 0;
 
-// Versioned status packet. v2 layout (14 bytes):
-//   [0]  version       = 2
-//   [1]  activity      0=stationary 1=walking 2=running 3=hand-motion
-//   [2]  fall_state    0=idle 1=fall confirmed (within alert window)
-//   [3]  battery_pct
-//   [4]  stress_pct
-//   [5]  hr            bpm
-//   [6]  spo2          %
-//   [7]  posture       0=upright 1=reclined 2=lying 3=inverted
-//   [8]  sleep_state   0=awake 1=resting 2=light_sleep 3=deep_sleep
-//   [9]  step_count_lo (uint16 LE)
-//   [10] step_count_hi
-//   [11] cadence_spm   steps per minute
-//   [12] hrv_rmssd     ms approx (HR-based proxy)
-//   [13] resting_hr    bpm
-#define TELEMETRY_PACKET_VERSION 2
+// Versioned status packet. v4 layout (19 bytes):
+//   [0]   version           = 4
+//   [1]   activity          0=stationary 1=walking 2=running 3=hand-motion
+//   [2]   fall_state        0=idle 1=fall confirmed (within alert window)
+//   [3]   battery_pct
+//   [4]   stress_pct
+//   [5]   hr                bpm
+//   [6]   spo2              %
+//   [7]   posture           0=upright 1=reclined 2=lying 3=inverted
+//   [8]   sleep_state       0=awake 1=resting 2=light_sleep 3=deep_sleep
+//   [9-10] step_count       u16 LE
+//   [11]  cadence_spm       steps per minute
+//   [12]  hrv_rmssd         HRV (HR-based proxy)
+//   [13]  resting_hr        bpm
+//   [14]  temp_dc           (temp_C - 30.0) * 10  → decode: temp = byte/10 + 30
+//   [15-16] battery_mv      u16 LE — battery voltage in millivolts (e.g. 3870 = 3.87V)
+//   [17-18] time_left_min   u16 LE — estimated runtime remaining at typical draw
+#define TELEMETRY_PACKET_VERSION 4
 struct __attribute__((packed)) TelemetryPacket {
     uint8_t  version;
     uint8_t  activity;
@@ -192,6 +200,9 @@ struct __attribute__((packed)) TelemetryPacket {
     uint8_t  cadence_spm;
     uint8_t  hrv_rmssd;
     uint8_t  resting_hr;
+    uint8_t  temp_dc;
+    uint16_t battery_mv;
+    uint16_t time_left_min;
 };
 
 // Activity state — written by background_task only
@@ -473,6 +484,15 @@ void ble_send_telemetry() {
     p.cadence_spm = dm.cadence_spm;
     p.hrv_rmssd   = dm.hrv_rmssd;
     p.resting_hr  = dm.resting_hr;
+    float t_enc = (disp_temp_c - 30.0f) * 10.0f;
+    if (t_enc < 0)      t_enc = 0;
+    else if (t_enc > 255) t_enc = 255;
+    p.temp_dc     = (uint8_t)t_enc;
+    int batt_pct  = battery_percent(cached_vbat);
+    float mv = cached_vbat * 1000.0f;
+    p.battery_mv  = (mv < 0) ? 0 : (mv > 65535.0f ? 65535 : (uint16_t)mv);
+    int mins = battery_minutes_remaining(batt_pct);
+    p.time_left_min = (mins < 0) ? 0 : (mins > 65535 ? 65535 : (uint16_t)mins);
     ble_tel_char->setValue((uint8_t*)&p, sizeof(p));
     ble_tel_char->notify();
 }
@@ -1093,9 +1113,11 @@ void background_task(void *pvParameters) {
                 }
             }
             if (best > 0.7f) {
+                int winner_internal = EI_TO_INTERNAL[winner & 3];
                 for (int i = 0; i < 4; i++) current_activity_tag[i] = 0.0f;
+                // Tag fed into Model B must match training order (EI alphabetical), keep raw winner index
                 current_activity_tag[winner] = 1.0f;
-                current_activity_idx = winner;
+                current_activity_idx = winner_internal;
                 update_activity_leds();
                 if (display_aod_active && xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     render_aod();
